@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -737,4 +738,333 @@ func (s *spySubscriptionChannel) Cancel(consumer string, _ bool) error {
 func (s *spySubscriptionChannel) Close() error {
 	s.closeCalled = true
 	return s.closeErr
+}
+
+// TestIsTransportFailure 验证连接/channel 关闭类错误识别。
+func TestIsTransportFailure(t *testing.T) {
+	require.True(t, isTransportFailure(amqp.ErrClosed))
+	require.True(t, isTransportFailure(fmt.Errorf("wrap: %w", amqp.ErrClosed)))
+	require.True(t, isTransportFailure(&amqp.Error{Code: 504, Reason: "channel/connection is not open"}))
+	require.True(t, isTransportFailure(errors.New(`Exception (504) Reason: "channel/connection is not open"`)))
+	require.False(t, isTransportFailure(errors.New("message nacked by broker")))
+}
+
+// TestPublishOutcomeErrorSubmittedSemantics 验证已提交消息不会被自动重发。
+func TestPublishOutcomeErrorSubmittedSemantics(t *testing.T) {
+	publisher := &sequencePublisher{errs: []error{
+		&publishOutcomeError{err: amqp.ErrClosed, submitted: true},
+	}}
+	client := &Client{
+		exchange:  "test.events",
+		publisher: publisher,
+	}
+
+	err := client.publishMessage(context.Background(), "test.events", "test.key", amqp.Publishing{Body: []byte("x")}, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "delivery outcome unknown")
+	require.Equal(t, 1, publisher.calls)
+}
+
+// TestPublishRetriesWhenNotSubmitted 验证请求未发出时的关闭错误会重试一次。
+func TestPublishRetriesWhenNotSubmitted(t *testing.T) {
+	publisher := &sequencePublisher{errs: []error{
+		&publishOutcomeError{err: amqp.ErrClosed, submitted: false},
+		nil,
+	}}
+	client := &Client{
+		exchange:  "test.events",
+		publisher: publisher,
+	}
+
+	err := client.publishMessage(context.Background(), "test.events", "test.key", amqp.Publishing{Body: []byte("x")}, true)
+	require.NoError(t, err)
+	require.Equal(t, 2, publisher.calls)
+}
+
+// TestPublishDoesNotRetryOnNonTransportError 验证非传输层错误不会重试。
+func TestPublishDoesNotRetryOnNonTransportError(t *testing.T) {
+	publisher := &sequencePublisher{errs: []error{errors.New("boom")}}
+	client := &Client{exchange: "test.events", publisher: publisher}
+
+	err := client.publishMessage(context.Background(), "test.events", "test.key", amqp.Publishing{Body: []byte("x")}, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "boom")
+	require.Equal(t, 1, publisher.calls)
+}
+
+// TestEnsureConnectedRejectsAfterClose 验证 Close 后不再重连。
+func TestEnsureConnectedRejectsAfterClose(t *testing.T) {
+	lifeCtx, cancel := context.WithCancel(context.Background())
+	client := &Client{
+		cfg:        Config{URL: "amqp://guest:guest@127.0.0.1:5672/"},
+		lifeCtx:    lifeCtx,
+		lifeCancel: cancel,
+		log:        &fakeLogger{},
+		subs:       make(map[*subscription]struct{}),
+		broken:     true,
+	}
+	require.NoError(t, client.Close())
+
+	err := client.ensureConnected(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "client already closed")
+}
+
+// TestBeginOrJoinReconnectSingleflight 验证并发 ensure 只会启动一次重连等待通道。
+func TestBeginOrJoinReconnectSingleflight(t *testing.T) {
+	lifeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &Client{
+		cfg:     Config{URL: "amqp://guest:guest@127.0.0.1:5672/"},
+		lifeCtx: lifeCtx,
+		log:     &fakeLogger{},
+		broken:  true,
+	}
+
+	wait1, err := client.beginOrJoinReconnect()
+	require.NoError(t, err)
+	require.Nil(t, wait1)
+
+	wait2, err := client.beginOrJoinReconnect()
+	require.NoError(t, err)
+	require.NotNil(t, wait2)
+
+	finished := make(chan struct{})
+	go func() {
+		<-wait2
+		close(finished)
+	}()
+
+	client.finishReconnect(nil)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("waiters were not released")
+	}
+}
+
+// TestReconnectDelayWithJitter 验证退避抖动不会低于基准间隔。
+func TestReconnectDelayWithJitter(t *testing.T) {
+	base := 200 * time.Millisecond
+	for i := 0; i < 20; i++ {
+		got := reconnectDelayWithJitter(base)
+		require.GreaterOrEqual(t, got, base)
+		require.LessOrEqual(t, got, base+base/5+time.Millisecond)
+	}
+}
+
+// TestMarkStoppedDoesNotCancelRunningContext 验证 Drain 使用的 markStopped 不会取消 handler context。
+func TestMarkStoppedDoesNotCancelRunningContext(t *testing.T) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	loopCtx, loopCancel := context.WithCancel(runCtx)
+
+	sub := &subscription{
+		parentCtx:  runCtx,
+		runCancel:  runCancel,
+		loopCancel: loopCancel,
+		stopCh:     make(chan struct{}),
+	}
+
+	sub.markStopped()
+	require.True(t, sub.isStopped())
+	require.NoError(t, runCtx.Err())
+	require.NoError(t, loopCtx.Err())
+	select {
+	case <-sub.stopCh:
+	default:
+		t.Fatal("stopCh should be closed after markStopped")
+	}
+
+	sub.cancelRunning()
+	require.Error(t, runCtx.Err())
+	require.Error(t, loopCtx.Err())
+}
+
+// TestDrainDoesNotCancelInFlightHandler 验证 Drain 等待 handler 完成且不取消其 context。
+func TestDrainDoesNotCancelInFlightHandler(t *testing.T) {
+	logger := &fakeLogger{}
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	defer lifeCancel()
+	client := &Client{
+		exchange: "test.events",
+		log:      logger,
+		subs:     make(map[*subscription]struct{}),
+		lifeCtx:  lifeCtx,
+	}
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	handlerStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	var canceledDuringHandler atomic.Bool
+	sub := &subscription{
+		client:    client,
+		opts:      SubscribeOptions{Queue: "example-service", RoutingKey: "test.order.created", MaxDeliver: 2},
+		parentCtx: runCtx,
+		runCancel: runCancel,
+		handler: func(ctx context.Context, _ Message) error {
+			handlerStarted <- struct{}{}
+			<-releaseHandler
+			if ctx.Err() != nil {
+				canceledDuringHandler.Store(true)
+			}
+			return nil
+		},
+		consumerTag:  "example-service",
+		done:         make(chan struct{}),
+		stopCh:       make(chan struct{}),
+		closeTimeout: time.Second,
+		channel:      &spySubscriptionChannel{},
+	}
+
+	deliveries := make(chan amqp.Delivery, 1)
+	deliveries <- amqp.Delivery{
+		Acknowledger: &spyAcknowledger{},
+		DeliveryTag:  1,
+		RoutingKey:   "test.order.created",
+		MessageId:    "msg-1",
+	}
+
+	client.mu.Lock()
+	client.subs[sub] = struct{}{}
+	client.mu.Unlock()
+	go client.runSubscription(sub, deliveries)
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	drainErr := make(chan error, 1)
+	go func() {
+		drainErr <- sub.Drain(context.Background())
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	require.False(t, canceledDuringHandler.Load(), "Drain must not cancel in-flight handler context")
+
+	close(releaseHandler)
+	close(deliveries)
+
+	select {
+	case err := <-drainErr:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain did not finish after handler completed")
+	}
+	require.False(t, canceledDuringHandler.Load(), "handler context was canceled during Drain")
+}
+
+// TestCloseCancelsInFlightHandler 验证 Close 会取消正在执行的 handler context。
+func TestCloseCancelsInFlightHandler(t *testing.T) {
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	defer lifeCancel()
+	client := &Client{
+		exchange: "test.events",
+		log:      &fakeLogger{},
+		subs:     make(map[*subscription]struct{}),
+		lifeCtx:  lifeCtx,
+	}
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	handlerStarted := make(chan context.Context, 1)
+	sub := &subscription{
+		client:    client,
+		opts:      SubscribeOptions{Queue: "example-service", RoutingKey: "test.order.created", MaxDeliver: 2},
+		parentCtx: runCtx,
+		runCancel: runCancel,
+		handler: func(ctx context.Context, _ Message) error {
+			handlerStarted <- ctx
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		consumerTag:  "example-service",
+		done:         make(chan struct{}),
+		stopCh:       make(chan struct{}),
+		closeTimeout: time.Second,
+		channel:      &spySubscriptionChannel{},
+	}
+
+	deliveries := make(chan amqp.Delivery, 1)
+	deliveries <- amqp.Delivery{
+		Acknowledger: &spyAcknowledger{},
+		DeliveryTag:  2,
+		RoutingKey:   "test.order.created",
+		MessageId:    "msg-2",
+	}
+
+	client.mu.Lock()
+	client.subs[sub] = struct{}{}
+	client.mu.Unlock()
+	go client.runSubscription(sub, deliveries)
+
+	var handlerCtx context.Context
+	select {
+	case handlerCtx = <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	require.NoError(t, sub.Close())
+	select {
+	case <-handlerCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel in-flight handler context")
+	}
+}
+
+// TestSubscribeStartFailureDoesNotRegisterSubscription 验证首次建连失败时不会注册订阅或启动恢复。
+func TestSubscribeStartFailureDoesNotRegisterSubscription(t *testing.T) {
+	origDial := dialAMQP
+	t.Cleanup(func() { dialAMQP = origDial })
+	dialAMQP = func(string, amqp.Config) (*amqp.Connection, error) {
+		return nil, errors.New("dial unavailable")
+	}
+
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	defer lifeCancel()
+	client := &Client{
+		cfg: Config{
+			URL:          "amqp://guest:guest@127.0.0.1:5672/",
+			Exchange:     "test.events",
+			ExchangeType: DefaultExchangeType,
+		},
+		exchange:       "test.events",
+		exchangeType:   DefaultExchangeType,
+		publishTimeout: DefaultPublishTimeout,
+		log:            &fakeLogger{},
+		lifeCtx:        lifeCtx,
+		lifeCancel:     lifeCancel,
+		subs:           make(map[*subscription]struct{}),
+		broken:         true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	sub, err := client.Subscribe(ctx, SubscribeOptions{
+		Queue:      "example-service",
+		RoutingKey: "test.order.created",
+	}, func(context.Context, Message) error { return nil })
+
+	require.Error(t, err)
+	require.Nil(t, sub)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	require.Empty(t, client.subs)
+}
+
+type sequencePublisher struct {
+	errs  []error
+	calls int
+}
+
+func (s *sequencePublisher) Publish(_ context.Context, _ string, _ string, _ amqp.Publishing, _ bool) error {
+	idx := s.calls
+	s.calls++
+	if idx >= len(s.errs) {
+		return nil
+	}
+	return s.errs[idx]
 }

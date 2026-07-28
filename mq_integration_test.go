@@ -8,6 +8,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -201,5 +204,235 @@ func TestIntegrationEnsureTopologyPreservesMessageBeforeSubscribe(t *testing.T) 
 		require.Equal(t, "stored-1", msg.ID)
 	case <-ctx.Done():
 		t.Fatalf("wait stored message failed: %v", ctx.Err())
+	}
+}
+
+// TestIntegrationPublishRecoversAfterPublishChannelClose 验证 publish channel 关闭后会自动重建并发布成功。
+func TestIntegrationPublishRecoversAfterPublishChannelClose(t *testing.T) {
+	client := newIntegrationClient(t)
+	routingKey, _ := integrationNames(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+
+	require.NoError(t, client.publishCh.Close())
+	client.invalidateTransport()
+
+	require.NoError(t, client.Publish(ctx, routingKey, []byte("after-channel-close"), WithMessageID("recover-ch-1"), WithMandatory(false)))
+	require.False(t, client.publishCh.IsClosed())
+}
+
+// TestIntegrationPublishRecoversAfterConnectionClose 验证连接关闭后会自动重连并发布成功。
+func TestIntegrationPublishRecoversAfterConnectionClose(t *testing.T) {
+	client := newIntegrationClient(t)
+	routingKey, _ := integrationNames(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	require.NoError(t, client.conn.Close())
+	client.invalidateTransport()
+
+	require.NoError(t, client.Publish(ctx, routingKey, []byte("after-conn-close"), WithMessageID("recover-conn-1"), WithMandatory(false)))
+	require.False(t, client.conn.IsClosed())
+	require.False(t, client.publishCh.IsClosed())
+}
+
+// TestIntegrationSubscribeRecoversAfterConnectionClose 验证订阅在断连后自动恢复，并能继续消费。
+func TestIntegrationSubscribeRecoversAfterConnectionClose(t *testing.T) {
+	client := newIntegrationClient(t)
+	routingKey, queue := integrationNames(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+
+	received := make(chan Message, 2)
+	sub, err := client.Subscribe(ctx, SubscribeOptions{
+		Queue:       queue,
+		RoutingKey:  routingKey,
+		BindingKeys: []string{routingKey},
+	}, func(_ context.Context, msg Message) error {
+		received <- msg
+		return nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, sub.Close())
+	})
+
+	require.NoError(t, client.Publish(ctx, routingKey, []byte("before"), WithMessageID("before-1")))
+	select {
+	case msg := <-received:
+		require.Equal(t, "before-1", msg.ID)
+	case <-ctx.Done():
+		t.Fatalf("wait before message failed: %v", ctx.Err())
+	}
+
+	require.NoError(t, client.conn.Close())
+	client.invalidateTransport()
+
+	require.NoError(t, client.Publish(ctx, routingKey, []byte("after"), WithMessageID("after-1")))
+	select {
+	case msg := <-received:
+		require.Equal(t, "after-1", msg.ID)
+	case <-ctx.Done():
+		t.Fatalf("wait after message failed: %v", ctx.Err())
+	}
+}
+
+// TestIntegrationRecoversAfterBrokerRestart 验证 RabbitMQ 宕机重启后客户端可自动重连，并继续发布与消费。
+//
+// 该测试会执行 docker compose down/up，会中断共享 broker，默认跳过。
+// 本地运行示例：
+//
+//	docker compose up -d rabbitmq
+//	RABBITMQ_URL=amqp://test:test123@127.0.0.1:5672/ \
+//	RABBITMQ_COMPOSE_RESTART=1 \
+//	  go test -tags=integration . -run TestIntegrationRecoversAfterBrokerRestart -v -count=1
+func TestIntegrationRecoversAfterBrokerRestart(t *testing.T) {
+	if os.Getenv("RABBITMQ_COMPOSE_RESTART") != "1" {
+		t.Skip("set RABBITMQ_COMPOSE_RESTART=1 to run docker compose broker restart test")
+	}
+	requireDockerCompose(t)
+
+	client := newIntegrationClient(t)
+	routingKey, queue := integrationNames(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+
+	received := make(chan Message, 4)
+	sub, err := client.Subscribe(ctx, SubscribeOptions{
+		Queue:       queue,
+		RoutingKey:  routingKey,
+		BindingKeys: []string{routingKey},
+	}, func(_ context.Context, msg Message) error {
+		received <- msg
+		return nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, sub.Close())
+	})
+
+	require.NoError(t, client.Publish(ctx, routingKey, []byte("before-restart"), WithMessageID("before-restart-1")))
+	select {
+	case msg := <-received:
+		require.Equal(t, "before-restart-1", msg.ID)
+		require.Equal(t, []byte("before-restart"), msg.Data)
+	case <-ctx.Done():
+		t.Fatalf("wait before-restart message failed: %v", ctx.Err())
+	}
+
+	restartRabbitMQBroker(t)
+	waitForRabbitMQReady(t, ctx, os.Getenv("RABBITMQ_URL"))
+
+	var publishedAfterID string
+	require.Eventually(t, func() bool {
+		messageID := "after-restart-" + uuid.NewString()[:8]
+		err := client.Publish(ctx, routingKey, []byte("after-restart"), WithMessageID(messageID))
+		if err != nil {
+			t.Logf("publish after restart still failing: %v", err)
+			return false
+		}
+		publishedAfterID = messageID
+		return true
+	}, 90*time.Second, 500*time.Millisecond, "publish after broker restart should succeed")
+
+	select {
+	case msg := <-received:
+		require.Equal(t, publishedAfterID, msg.ID)
+		require.Equal(t, []byte("after-restart"), msg.Data)
+	case <-ctx.Done():
+		t.Fatalf("wait after-restart message failed: %v", ctx.Err())
+	}
+
+	require.False(t, client.conn.IsClosed())
+	require.False(t, client.publishCh.IsClosed())
+}
+
+func requireDockerCompose(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is required for broker restart test")
+	}
+	cmd := exec.Command("docker", "compose", "version")
+	if err := cmd.Run(); err != nil {
+		t.Skip("docker compose is required for broker restart test")
+	}
+}
+
+func restartRabbitMQBroker(t *testing.T) {
+	t.Helper()
+
+	composeFile := findDockerComposeFile(t)
+	t.Logf("restarting rabbitmq via docker compose file=%s", composeFile)
+
+	down := exec.Command("docker", "compose", "-f", composeFile, "down", "--remove-orphans")
+	down.Stdout = os.Stdout
+	down.Stderr = os.Stderr
+	require.NoError(t, down.Run(), "docker compose down failed")
+
+	// 给旧连接明确一段断开窗口，避免立刻 up 时时序过短。
+	time.Sleep(2 * time.Second)
+
+	up := exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "rabbitmq")
+	up.Stdout = os.Stdout
+	up.Stderr = os.Stderr
+	require.NoError(t, up.Run(), "docker compose up failed")
+}
+
+func findDockerComposeFile(t *testing.T) string {
+	t.Helper()
+
+	if custom := strings.TrimSpace(os.Getenv("RABBITMQ_COMPOSE_FILE")); custom != "" {
+		if _, err := os.Stat(custom); err != nil {
+			t.Fatalf("RABBITMQ_COMPOSE_FILE=%s is not accessible: %v", custom, err)
+		}
+		return custom
+	}
+
+	candidates := []string{
+		"docker-compose.yml",
+		filepath.Join("..", "docker-compose.yml"),
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, "docker-compose.yml"))
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			abs, err := filepath.Abs(candidate)
+			require.NoError(t, err)
+			return abs
+		}
+	}
+	t.Fatal("docker-compose.yml not found; set RABBITMQ_COMPOSE_FILE")
+	return ""
+}
+
+func waitForRabbitMQReady(t *testing.T, ctx context.Context, url string) {
+	t.Helper()
+	require.NotEmpty(t, url)
+
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 90*time.Second)
+		t.Cleanup(cancel)
+		deadline, _ = ctx.Deadline()
+	}
+
+	for {
+		conn, err := amqp.Dial(url)
+		if err == nil {
+			_ = conn.Close()
+			t.Log("rabbitmq is ready after restart")
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("wait rabbitmq ready timeout: last error: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait rabbitmq ready canceled: %v (last error: %v)", ctx.Err(), err)
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }

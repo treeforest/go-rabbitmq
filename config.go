@@ -22,6 +22,12 @@ const (
 
 	// DefaultExchangeType 表示默认 exchange 类型。
 	DefaultExchangeType = "topic"
+
+	// defaultReconnectInitial 表示连接恢复的初始退避时间。
+	defaultReconnectInitial = 100 * time.Millisecond
+
+	// defaultReconnectMax 表示连接恢复的最大退避时间。
+	defaultReconnectMax = 30 * time.Second
 )
 
 // Logger 定义 mq 包需要的最小日志能力。

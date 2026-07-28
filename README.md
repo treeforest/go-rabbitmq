@@ -83,6 +83,17 @@ docker compose up -d rabbitmq
 RABBITMQ_URL=amqp://test:test123@127.0.0.1:5672/ go test -tags=integration . -v
 ```
 
+模拟 RabbitMQ 宕机重启（`docker compose down` → `up`）后的重连测试默认跳过，需显式开启：
+
+```bash
+docker compose up -d rabbitmq
+RABBITMQ_URL=amqp://test:test123@127.0.0.1:5672/ \
+RABBITMQ_COMPOSE_RESTART=1 \
+  go test -tags=integration . -run TestIntegrationRecoversAfterBrokerRestart -v -count=1
+```
+
+该测试会重启共享 broker，请单独运行，不要与其它集成测试并行。
+
 ## 拓扑说明
 
 一次 `Subscribe` 会确保当前订阅链路需要的 exchange、queue 和 binding 都存在。假设：
@@ -200,6 +211,25 @@ x-mq-retry-count
 
 订阅关闭时，`mq` 包会串行化 `ack/nack/cancel/close`，避免同一个 AMQP channel 上的确认和关闭命令交错。
 
+## 连接恢复
+
+`Client` 会在 connection 或 publish channel 被动关闭后自动恢复，调用方无需重启进程或重新创建客户端：
+
+1. 监听 connection / publish channel 的 `NotifyClose`，把当前传输层标记为不可用。
+2. 后续 `Publish`、`EnsureTopology`、`Subscribe` 会触发单飞重连：同一时刻只有一个 Dial/重建流程。
+3. 重连使用指数退避（初始约 `100ms`，最大约 `30s`），并受调用方 `context` 与 `Client.Close()` 约束。
+4. 连接仍可用时优先重建 publish channel；否则重新 Dial，并重新启用 publisher confirm。
+5. 已建立的 `Subscription` 会自动重新声明拓扑、重新设置 Qos 并重新 Consume；同一个 `Subscription` 句柄保持有效。
+
+语义边界：
+
+- 这是至少一次（at-least-once）模型，不承诺 exactly-once。
+- 若消息已提交给 broker 但 confirm 尚未返回（超时、连接中断等），`Publish` 会返回带 `delivery outcome unknown` 的错误，**不会自动补发**，避免重复投递。
+- 调用方应继续为消息设置稳定的 `MessageID`，并在 handler 内按 `msg.ID` 做幂等。
+- 断连期间库内不会在内存中缓存待发布消息；发布失败由调用方决定是否重试。
+- 连接恢复后，broker 可能重新投递未 ack 消息；重复消费应被视为正常情况。
+- `Client.Close()` 后不会再重连，也不会恢复任何订阅。
+
 ## 建议
 
 - `Queue` 建议带上服务名和业务名，例如 `example-service.order-events`，方便在 RabbitMQ 控制台定位。
@@ -207,3 +237,4 @@ x-mq-retry-count
 - handler 返回错误前不要自行 ack/nack，统一交给 `mq` 包管理。
 - DLQ 要配套告警或补偿工具，否则最终失败消息只会堆积在队列里。
 - `RetryDelay` 会参与 retry queue 名称，同一个业务队列如果使用多个 delay，会产生多个 retry queue。
+- 业务侧重试 `Publish` 时，请区分可重试错误与 `delivery outcome unknown`；后者需要按幂等语义处理，不能盲目再发同一条业务事件。
