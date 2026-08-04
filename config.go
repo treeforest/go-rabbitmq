@@ -4,10 +4,9 @@ package mq
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
-
-	"github.com/treeforest/golog/v2"
 )
 
 const (
@@ -31,7 +30,7 @@ const (
 )
 
 // Logger 定义 mq 包需要的最小日志能力。
-// 外部可传入任意满足该接口的日志实现；为空时使用 golog 默认实现。
+// 外部可传入任意满足该接口的日志实现；为空时使用 slog 默认实现。
 type Logger interface {
 	// Infof 记录普通运行信息。
 	Infof(format string, args ...interface{})
@@ -66,8 +65,25 @@ type Config struct {
 	// CloseTimeout 表示关闭订阅和连接的默认等待时间。
 	CloseTimeout time.Duration
 
-	// Logger 表示模块日志记录器；为空时使用默认 golog 适配实现。
+	// Logger 表示模块日志记录器；为空时使用默认 slog 适配实现。
 	Logger Logger
+}
+
+// slogLogger 将 slog.Logger 适配为 mq.Logger。
+type slogLogger struct {
+	log *slog.Logger
+}
+
+func (l *slogLogger) Infof(format string, args ...interface{}) {
+	l.log.Info(fmt.Sprintf(format, args...))
+}
+
+func (l *slogLogger) Warnf(format string, args ...interface{}) {
+	l.log.Warn(fmt.Sprintf(format, args...))
+}
+
+func (l *slogLogger) Errorf(format string, args ...interface{}) {
+	l.log.Error(fmt.Sprintf(format, args...))
 }
 
 // normalizeConfig 校验客户端配置，并补齐连接、发布和关闭相关默认值。
@@ -104,5 +120,5 @@ func normalizeConfig(cfg Config) (Config, error) {
 
 // defaultLogger 返回 mq 默认日志实现。
 func defaultLogger() Logger {
-	return golog.NewLogger(golog.NewConfig()).Clone()
+	return &slogLogger{log: slog.Default()}
 }
