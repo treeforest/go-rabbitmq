@@ -33,13 +33,13 @@ const (
 // 外部可传入任意满足该接口的日志实现；为空时使用 slog 默认实现。
 type Logger interface {
 	// Infof 记录普通运行信息。
-	Infof(format string, args ...interface{})
+	Infof(format string, args ...any)
 
 	// Warnf 记录可恢复但需要关注的异常分支。
-	Warnf(format string, args ...interface{})
+	Warnf(format string, args ...any)
 
 	// Errorf 记录真实失败路径。
-	Errorf(format string, args ...interface{})
+	Errorf(format string, args ...any)
 }
 
 // Config 表示 RabbitMQ 客户端配置。
@@ -74,15 +74,15 @@ type slogLogger struct {
 	log *slog.Logger
 }
 
-func (l *slogLogger) Infof(format string, args ...interface{}) {
+func (l *slogLogger) Infof(format string, args ...any) {
 	l.log.Info(fmt.Sprintf(format, args...))
 }
 
-func (l *slogLogger) Warnf(format string, args ...interface{}) {
+func (l *slogLogger) Warnf(format string, args ...any) {
 	l.log.Warn(fmt.Sprintf(format, args...))
 }
 
-func (l *slogLogger) Errorf(format string, args ...interface{}) {
+func (l *slogLogger) Errorf(format string, args ...any) {
 	l.log.Error(fmt.Sprintf(format, args...))
 }
 

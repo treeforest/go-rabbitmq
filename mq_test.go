@@ -368,7 +368,9 @@ func TestPublishReturnHelpers(t *testing.T) {
 	close(closedReturns)
 	closedPublisher := &amqpPublisher{returns: closedReturns}
 	require.NotPanics(t, closedPublisher.drainReturns)
-	require.Contains(t, publishReturnError(*closedPublisher.popReturned()).Error(), "return channel closed")
+	closedReturn := closedPublisher.popReturned()
+	require.NotNil(t, closedReturn)
+	require.Contains(t, publishReturnError(*closedReturn).Error(), "return channel closed")
 }
 
 // TestHandleDeliverySuccessAck 验证 handler 成功时会手动 ack。
@@ -541,7 +543,7 @@ func TestHandleDeliveryFailurePublishesRetry(t *testing.T) {
 	require.Equal(t, "test.events.retry", publisher.published[0].exchange)
 	require.Equal(t, "test.order.created", publisher.published[0].routingKey)
 	require.True(t, publisher.published[0].mandatory)
-	require.Equal(t, int32(1), publisher.published[0].publishing.Headers[retryCountHeader])
+	require.Equal(t, int64(1), publisher.published[0].publishing.Headers[retryCountHeader])
 	require.Equal(t, uint64(8), acker.ackTag)
 	require.False(t, acker.nackCalled)
 }
@@ -569,7 +571,7 @@ func TestHandleDeliveryFailurePublishesDLQ(t *testing.T) {
 	require.Error(t, err)
 	require.Len(t, publisher.published, 1)
 	require.Equal(t, "test.events.dlx", publisher.published[0].exchange)
-	require.Equal(t, int32(2), publisher.published[0].publishing.Headers[retryCountHeader])
+	require.Equal(t, int64(2), publisher.published[0].publishing.Headers[retryCountHeader])
 	require.Equal(t, uint64(9), acker.ackTag)
 }
 
@@ -680,19 +682,19 @@ type fakeLogger struct {
 
 var _ Logger = (*fakeLogger)(nil)
 
-func (f *fakeLogger) Infof(format string, args ...interface{}) {
+func (f *fakeLogger) Infof(format string, args ...any) {
 	f.infos = append(f.infos, formatLog(format, args...))
 }
 
-func (f *fakeLogger) Warnf(format string, args ...interface{}) {
+func (f *fakeLogger) Warnf(format string, args ...any) {
 	f.warns = append(f.warns, formatLog(format, args...))
 }
 
-func (f *fakeLogger) Errorf(format string, args ...interface{}) {
+func (f *fakeLogger) Errorf(format string, args ...any) {
 	f.errors = append(f.errors, formatLog(format, args...))
 }
 
-func formatLog(format string, args ...interface{}) string {
+func formatLog(format string, args ...any) string {
 	return fmt.Sprintf(format, args...)
 }
 
@@ -812,11 +814,9 @@ func TestEnsureConnectedRejectsAfterClose(t *testing.T) {
 
 // TestBeginOrJoinReconnectSingleflight 验证并发 ensure 只会启动一次重连等待通道。
 func TestBeginOrJoinReconnectSingleflight(t *testing.T) {
-	lifeCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	client := &Client{
 		cfg:     Config{URL: "amqp://guest:guest@127.0.0.1:5672/"},
-		lifeCtx: lifeCtx,
+		lifeCtx: t.Context(),
 		log:     &fakeLogger{},
 		broken:  true,
 	}
@@ -846,7 +846,7 @@ func TestBeginOrJoinReconnectSingleflight(t *testing.T) {
 // TestReconnectDelayWithJitter 验证退避抖动不会低于基准间隔。
 func TestReconnectDelayWithJitter(t *testing.T) {
 	base := 200 * time.Millisecond
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		got := reconnectDelayWithJitter(base)
 		require.GreaterOrEqual(t, got, base)
 		require.LessOrEqual(t, got, base+base/5+time.Millisecond)
@@ -884,13 +884,11 @@ func TestMarkStoppedDoesNotCancelRunningContext(t *testing.T) {
 // TestDrainDoesNotCancelInFlightHandler 验证 Drain 等待 handler 完成且不取消其 context。
 func TestDrainDoesNotCancelInFlightHandler(t *testing.T) {
 	logger := &fakeLogger{}
-	lifeCtx, lifeCancel := context.WithCancel(context.Background())
-	defer lifeCancel()
 	client := &Client{
 		exchange: "test.events",
 		log:      logger,
 		subs:     make(map[*subscription]struct{}),
-		lifeCtx:  lifeCtx,
+		lifeCtx:  t.Context(),
 	}
 
 	runCtx, runCancel := context.WithCancel(context.Background())
@@ -958,13 +956,11 @@ func TestDrainDoesNotCancelInFlightHandler(t *testing.T) {
 
 // TestCloseCancelsInFlightHandler 验证 Close 会取消正在执行的 handler context。
 func TestCloseCancelsInFlightHandler(t *testing.T) {
-	lifeCtx, lifeCancel := context.WithCancel(context.Background())
-	defer lifeCancel()
 	client := &Client{
 		exchange: "test.events",
 		log:      &fakeLogger{},
 		subs:     make(map[*subscription]struct{}),
-		lifeCtx:  lifeCtx,
+		lifeCtx:  t.Context(),
 	}
 
 	runCtx, runCancel := context.WithCancel(context.Background())

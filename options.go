@@ -4,6 +4,7 @@ package mq
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 )
@@ -81,9 +82,7 @@ func WithHeaders(headers map[string]string) PublishOption {
 		if opts.Headers == nil {
 			opts.Headers = make(map[string]string, len(headers))
 		}
-		for key, value := range headers {
-			opts.Headers[key] = value
-		}
+		maps.Copy(opts.Headers, headers)
 	}
 }
 
@@ -154,7 +153,7 @@ func validateBindingKey(bindingKey string, index int) error {
 		return fmt.Errorf("normalize subscribe options failed: binding key %q uses unsupported wildcard >", bindingKey)
 	}
 
-	for _, word := range strings.Split(bindingKey, ".") {
+	for word := range strings.SplitSeq(bindingKey, ".") {
 		if word == "" {
 			return fmt.Errorf("normalize subscribe options failed: binding key %q contains empty word", bindingKey)
 		}

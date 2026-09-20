@@ -4,10 +4,12 @@ package mq
 
 import (
 	"context"
+	crand "crypto/rand"
+	"math/big"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
-	"math/rand"
 	"net"
 	"reflect"
 	"strconv"
@@ -27,9 +29,7 @@ const (
 )
 
 // dialAMQP 允许测试替换 Dial 实现；生产路径默认调用 amqp.DialConfig。
-var dialAMQP = func(url string, cfg amqp.Config) (*amqp.Connection, error) {
-	return amqp.DialConfig(url, cfg)
-}
+var dialAMQP = amqp.DialConfig
 
 // Client 表示基于 RabbitMQ 的消息队列客户端。
 // Client 必须通过 NewClient 创建；零值不包含 AMQP 连接，不能直接使用。
@@ -187,7 +187,7 @@ func (c *Client) EnsureTopology(ctx context.Context, opts SubscribeOptions) erro
 		return fmt.Errorf("ensure rabbitmq topology failed: open channel: %w", err)
 	}
 	defer func() {
-		_ = ch.Close()
+		discardCloseErr(ch)
 	}()
 
 	// 3. 声明主/retry/DLQ 队列及 exchange binding。
@@ -280,7 +280,7 @@ func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions, handler H
 	if c.closed {
 		c.mu.Unlock()
 		runCancel()
-		_ = ch.Close()
+		discardCloseErr(ch)
 		return nil, fmt.Errorf("subscribe rabbitmq failed: client already closed")
 	}
 	c.subs[sub] = struct{}{}
@@ -609,7 +609,7 @@ func (c *Client) reconnectWithBackoff(ctx context.Context) error {
 		case <-ctx.Done():
 			timer.Stop()
 			if lastErr != nil {
-				return fmt.Errorf("reconnect rabbitmq failed: %w: %v", ctx.Err(), lastErr)
+				return fmt.Errorf("reconnect rabbitmq failed: %w: %w", ctx.Err(), lastErr)
 			}
 			return fmt.Errorf("reconnect rabbitmq failed: %w", ctx.Err())
 		case <-c.lifeCtx.Done():
@@ -653,7 +653,7 @@ func (c *Client) establishTransport() error {
 
 	pubCh, publisher, err := openPublishChannel(newConn, c.exchange, c.exchangeType, c.publishTimeout)
 	if err != nil {
-		_ = newConn.Close()
+		discardCloseErr(newConn)
 		return err
 	}
 
@@ -666,11 +666,11 @@ func openPublishChannel(conn *amqp.Connection, exchange, exchangeType string, pu
 		return nil, nil, fmt.Errorf("open publish channel: %w", err)
 	}
 	if err := declareExchange(publishCh, exchange, exchangeType); err != nil {
-		_ = publishCh.Close()
+		discardCloseErr(publishCh)
 		return nil, nil, fmt.Errorf("declare exchange %s: %w", exchange, err)
 	}
 	if err := publishCh.Confirm(false); err != nil {
-		_ = publishCh.Close()
+		discardCloseErr(publishCh)
 		return nil, nil, fmt.Errorf("enable publisher confirm: %w", err)
 	}
 	return publishCh, newAMQPPublisher(publishCh, publishTimeout), nil
@@ -689,9 +689,9 @@ func (c *Client) installTransport(
 	if c.lifeCtx.Err() != nil {
 		c.reconnectMu.Unlock()
 		c.publishMu.Unlock()
-		_ = closeAMQP(publishCh)
+		discardCloseErr(publishCh)
 		if replaceConn {
-			_ = closeAMQP(conn)
+			discardCloseErr(conn)
 		}
 		return fmt.Errorf("client already closed")
 	}
@@ -715,10 +715,10 @@ func (c *Client) installTransport(
 	c.watchTransport(conn, publishCh, gen)
 
 	if oldPublishCh != nil && oldPublishCh != publishCh {
-		_ = closeAMQP(oldPublishCh)
+		discardCloseErr(oldPublishCh)
 	}
 	if oldConn != nil && oldConn != conn {
-		_ = closeAMQP(oldConn)
+		discardCloseErr(oldConn)
 	}
 
 	if gen == 1 {
@@ -845,78 +845,31 @@ func (c *Client) declareTopology(ctx context.Context, ch *amqp.Channel, opts Sub
 
 // runSubscription 监督单个订阅意图：首次消费由 Subscribe 同步建立，后续断连后自动恢复。
 func (c *Client) runSubscription(sub *subscription, initial <-chan amqp.Delivery) {
-	defer func() {
-		_ = sub.closeChannel()
-		close(sub.done)
-
-		c.mu.Lock()
-		delete(c.subs, sub)
-		c.mu.Unlock()
-	}()
+	defer c.finishSubscription(sub)
 
 	deliveries := initial
 	for {
-		if sub.isStopped() || c.isClosed() {
-			return
-		}
-		if sub.parentCtx != nil && sub.parentCtx.Err() != nil {
+		if c.subscriptionEnded(sub) {
 			return
 		}
 
-		var loopCtx context.Context
-		var cancel context.CancelFunc
-
-		if deliveries == nil {
-			waitCtx, cancelWait := c.subscriptionWaitContext(sub)
-			err := c.ensureConnected(waitCtx)
-			cancelWait()
-			if err != nil {
-				if sub.isStopped() || c.isClosed() || (sub.parentCtx != nil && sub.parentCtx.Err() != nil) {
-					return
-				}
-				continue
+		loopCtx, cancel, activeDeliveries, action := c.prepareSubscriptionLoop(sub, deliveries)
+		switch action {
+		case subscriptionLoopExit:
+			return
+		case subscriptionLoopRetry:
+			continue
+		case subscriptionLoopReady:
+			if loopCtx == nil || activeDeliveries == nil {
+				return
 			}
-
-			loopCtx, cancel = context.WithCancel(sub.parentCtx)
-			sub.setLoopCancel(cancel)
-
-			ch, nextDeliveries, startErr := c.startConsume(sub)
-			if startErr != nil {
-				cancel()
-				if sub.isStopped() || c.isClosed() || (sub.parentCtx != nil && sub.parentCtx.Err() != nil) {
-					return
-				}
-				c.invalidateTransport()
-				c.log.Warnf(
-					"module=%s action=subscribe_recover status=start_failed queue=%s error=%v",
-					defaultModuleName,
-					sub.opts.Queue,
-					startErr,
-				)
-				select {
-				case <-time.After(defaultReconnectInitial):
-				case <-sub.stopCh:
-					return
-				case <-sub.parentCtx.Done():
-					return
-				case <-c.lifeCtx.Done():
-					return
-				}
-				continue
-			}
-			sub.setChannel(ch)
-			deliveries = nextDeliveries
-		} else {
-			loopCtx, cancel = context.WithCancel(sub.parentCtx)
-			sub.setLoopCancel(cancel)
+			c.consumeLoop(loopCtx, sub, sub.opts, activeDeliveries, sub.handler)
+			cancel()
+			discardErr(sub.closeChannel())
+			deliveries = nil
 		}
 
-		c.consumeLoop(loopCtx, sub, sub.opts, deliveries, sub.handler)
-		cancel()
-		_ = sub.closeChannel()
-		deliveries = nil
-
-		if sub.isStopped() || c.isClosed() || (sub.parentCtx != nil && sub.parentCtx.Err() != nil) {
+		if c.subscriptionEnded(sub) {
 			return
 		}
 
@@ -926,6 +879,89 @@ func (c *Client) runSubscription(sub *subscription, initial <-chan amqp.Delivery
 			defaultModuleName,
 			sub.opts.Queue,
 		)
+	}
+}
+
+type subscriptionLoopAction int
+
+const (
+	subscriptionLoopExit  subscriptionLoopAction = 0
+	subscriptionLoopRetry subscriptionLoopAction = 1
+	subscriptionLoopReady subscriptionLoopAction = 2
+)
+
+func (c *Client) finishSubscription(sub *subscription) {
+	discardErr(sub.closeChannel())
+	close(sub.done)
+
+	c.mu.Lock()
+	delete(c.subs, sub)
+	c.mu.Unlock()
+}
+
+func (c *Client) subscriptionEnded(sub *subscription) bool {
+	if sub.isStopped() || c.isClosed() {
+		return true
+	}
+	return sub.parentCtx != nil && sub.parentCtx.Err() != nil
+}
+
+func (c *Client) prepareSubscriptionLoop(
+	sub *subscription,
+	deliveries <-chan amqp.Delivery,
+) (context.Context, context.CancelFunc, <-chan amqp.Delivery, subscriptionLoopAction) {
+	if deliveries != nil {
+		loopCtx, cancel := context.WithCancel(sub.parentCtx)
+		sub.setLoopCancel(cancel)
+		return loopCtx, cancel, deliveries, subscriptionLoopReady
+	}
+
+	waitCtx, cancelWait := c.subscriptionWaitContext(sub)
+	err := c.ensureConnected(waitCtx)
+	cancelWait()
+	if err != nil {
+		if c.subscriptionEnded(sub) {
+			return nil, nil, nil, subscriptionLoopExit
+		}
+		return nil, nil, nil, subscriptionLoopRetry
+	}
+
+	loopCtx, cancel := context.WithCancel(sub.parentCtx)
+	sub.setLoopCancel(cancel)
+
+	ch, nextDeliveries, startErr := c.startConsume(sub)
+	if startErr != nil {
+		cancel()
+		if c.subscriptionEnded(sub) {
+			return nil, nil, nil, subscriptionLoopExit
+		}
+		c.invalidateTransport()
+		c.log.Warnf(
+			"module=%s action=subscribe_recover status=start_failed queue=%s error=%v",
+			defaultModuleName,
+			sub.opts.Queue,
+			startErr,
+		)
+		if c.waitAfterSubscribeRecoverFailure(sub) {
+			return nil, nil, nil, subscriptionLoopExit
+		}
+		return nil, nil, nil, subscriptionLoopRetry
+	}
+
+	sub.setChannel(ch)
+	return loopCtx, cancel, nextDeliveries, subscriptionLoopReady
+}
+
+func (c *Client) waitAfterSubscribeRecoverFailure(sub *subscription) bool {
+	select {
+	case <-time.After(defaultReconnectInitial):
+		return false
+	case <-sub.stopCh:
+		return true
+	case <-sub.parentCtx.Done():
+		return true
+	case <-c.lifeCtx.Done():
+		return true
 	}
 }
 
@@ -961,13 +997,13 @@ func (c *Client) startConsume(sub *subscription) (*amqp.Channel, <-chan amqp.Del
 		return nil, nil, fmt.Errorf("open channel: %w", err)
 	}
 	if err := ch.Qos(sub.opts.Prefetch, 0, false); err != nil {
-		_ = ch.Close()
+		discardCloseErr(ch)
 		return nil, nil, fmt.Errorf("set qos queue=%s: %w", sub.opts.Queue, err)
 	}
 
 	deliveries, err := ch.Consume(sub.opts.Queue, sub.consumerTag, false, false, false, false, nil)
 	if err != nil {
-		_ = ch.Close()
+		discardCloseErr(ch)
 		return nil, nil, fmt.Errorf("consume queue=%s: %w", sub.opts.Queue, err)
 	}
 	return ch, deliveries, nil
@@ -1057,11 +1093,7 @@ func (c *Client) handleDelivery(ctx context.Context, opts SubscribeOptions, deli
 	}
 
 	// 处理失败，投递到 retry exchange 或 DLX
-	if retryErr := c.handleFailure(ctx, opts, delivery, err); retryErr != nil {
-		return retryErr
-	}
-
-	return nil
+	return c.handleFailure(ctx, opts, delivery, err)
 }
 
 // handleFailure 将失败消息转发到 retry exchange 或 DLX，成功转发后再 ack 原消息。
@@ -1081,13 +1113,13 @@ func (c *Client) handleFailure(ctx context.Context, opts SubscribeOptions, deliv
 	if err := c.publishMessage(ctx, targetExchange, delivery.RoutingKey, publishing, true); err != nil {
 		if nackErr := delivery.Nack(false, true); nackErr != nil {
 			return fmt.Errorf(
-				"handle rabbitmq message failed: %w; publish failure target failed: %v; nack requeue failed: %v",
+				"handle rabbitmq message failed: %w; publish failure target failed: %w; nack requeue failed: %w",
 				handlerErr,
 				err,
 				nackErr,
 			)
 		}
-		return fmt.Errorf("handle rabbitmq message failed: %w; publish failure target failed: %v", handlerErr, err)
+		return fmt.Errorf("handle rabbitmq message failed: %w; publish failure target failed: %w", handlerErr, err)
 	}
 
 	// 转发成功，ack 原消息
@@ -1275,7 +1307,7 @@ func toMessage(exchange, queue string, delivery amqp.Delivery) Message {
 // publishingFromDelivery 复制原消息属性并递增 retry count，用于失败后转发到 retry/DLQ。
 func publishingFromDelivery(delivery amqp.Delivery, retryCount int) amqp.Publishing {
 	headers := cloneTable(delivery.Headers)
-	headers[retryCountHeader] = int32(retryCount)
+	headers[retryCountHeader] = int64(retryCount)
 
 	return amqp.Publishing{
 		Headers:         headers,
@@ -1371,9 +1403,7 @@ func tableToHeaders(table amqp.Table) map[string]string {
 // cloneTable 复制 AMQP table，避免修改原 delivery header。
 func cloneTable(table amqp.Table) amqp.Table {
 	cloned := make(amqp.Table, len(table)+1)
-	for key, value := range table {
-		cloned[key] = value
-	}
+	maps.Copy(cloned, table)
 	return cloned
 }
 
@@ -1410,6 +1440,20 @@ func retryCountFromHeaders(table amqp.Table) int {
 	}
 }
 
+// discardCloseErr 在清理路径关闭资源，忽略已关闭等可预期错误。
+func discardCloseErr(closer interface{ Close() error }) {
+	if err := closeAMQP(closer); err != nil {
+		return
+	}
+}
+
+// discardErr 在清理路径忽略可预期错误。
+func discardErr(err error) {
+	if err != nil {
+		return
+	}
+}
+
 // closeAMQP 关闭 AMQP 资源，并忽略已经关闭的正常状态。
 func closeAMQP(closer interface{ Close() error }) error {
 	if closer == nil {
@@ -1427,7 +1471,7 @@ func closeAMQP(closer interface{ Close() error }) error {
 
 // isAMQPClosed 判断错误是否表示 AMQP 资源已经关闭。
 func isAMQPClosed(err error) bool {
-	return errors.Is(err, amqp.ErrClosed) || err == amqp.ErrClosed
+	return errors.Is(err, amqp.ErrClosed)
 }
 
 // isTransportFailure 判断错误是否表示 connection/channel 传输层失败。
@@ -1455,8 +1499,12 @@ func reconnectDelayWithJitter(base time.Duration) time.Duration {
 	if base <= 0 {
 		return defaultReconnectInitial
 	}
-	jitter := time.Duration(rand.Int63n(int64(base/5) + 1))
-	return base + jitter
+	maxJitter := int64(base/5) + 1
+	n, err := crand.Int(crand.Reader, big.NewInt(maxJitter))
+	if err != nil {
+		return base
+	}
+	return base + time.Duration(n.Int64())
 }
 
 // isClosed 返回客户端是否已经关闭。

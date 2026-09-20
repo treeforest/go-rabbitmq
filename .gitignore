@@ -25,3 +25,6 @@ vendor/
 # OS
 .DS_Store
 Thumbs.db
+
+# Audit reports
+tmp/
