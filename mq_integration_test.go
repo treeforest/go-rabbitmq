@@ -1,7 +1,8 @@
 //go:build integration
 
-// Package mq 的集成测试需要外部 RabbitMQ 服务。
+// 集成测试需要外部 RabbitMQ 服务。
 // 运行示例：RABBITMQ_URL=amqp://test:test123@127.0.0.1:5672/ go test -tags=integration . -v
+
 package mq
 
 import (
@@ -61,7 +62,6 @@ func TestIntegrationPublishSubscribe(t *testing.T) {
 	received := make(chan Message, 1)
 	sub, err := client.Subscribe(ctx, SubscribeOptions{
 		Queue:       queue,
-		RoutingKey:  routingKey,
 		BindingKeys: []string{routingKey},
 	}, func(_ context.Context, msg Message) error {
 		received <- msg
@@ -95,11 +95,10 @@ func TestIntegrationFailureRetriesThenSucceeds(t *testing.T) {
 	var attempts atomic.Int32
 	done := make(chan struct{})
 	sub, err := client.Subscribe(ctx, SubscribeOptions{
-		Queue:       queue,
-		RoutingKey:  routingKey,
-		BindingKeys: []string{routingKey},
-		MaxDeliver:  3,
-		RetryDelay:  200 * time.Millisecond,
+		Queue:         queue,
+		BindingKeys:   []string{routingKey},
+		MaxDeliveries: 3,
+		RetryDelay:    200 * time.Millisecond,
 	}, func(_ context.Context, _ Message) error {
 		if attempts.Add(1) == 1 {
 			// 测试首次处理失败，模拟进行再次投递
@@ -132,13 +131,12 @@ func TestIntegrationFailureGoesToDLQ(t *testing.T) {
 	t.Cleanup(cancel)
 
 	sub, err := client.Subscribe(ctx, SubscribeOptions{
-		Queue:       queue,
-		RoutingKey:  routingKey,
-		BindingKeys: []string{routingKey},
-		MaxDeliver:  1,
-		RetryDelay:  100 * time.Millisecond,
+		Queue:         queue,
+		BindingKeys:   []string{routingKey},
+		MaxDeliveries: 1,
+		RetryDelay:    100 * time.Millisecond,
 	}, func(context.Context, Message) error {
-		// 总是返回错误，导致投递次数超过 MaxDeliver 进入 DLQ
+		// 总是返回错误，导致投递次数超过 MaxDeliveries 进入 DLQ
 		return fmt.Errorf("permanent failure")
 	})
 	require.NoError(t, err)
@@ -174,6 +172,131 @@ func TestIntegrationFailureGoesToDLQ(t *testing.T) {
 	}
 }
 
+// TestIntegrationRetryAndDLQIsolatedBetweenWildcardSubscribers 验证同一 Topic 通配符下的多个订阅队列在失败重试和进入 DLQ 时互不串流污染。
+func TestIntegrationRetryAndDLQIsolatedBetweenWildcardSubscribers(t *testing.T) {
+	client := newIntegrationClient(t)
+	routingKey, queueA := integrationNames(t)
+	_, queueB := integrationNames(t)
+	bindingKey := "test.key.#"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	var attemptsA atomic.Int32
+	var receivedKRoutingKeysA []string
+	var attemptsB atomic.Int32
+	doneB := make(chan struct{})
+
+	subA, err := client.Subscribe(ctx, SubscribeOptions{
+		Queue:         queueA,
+		BindingKeys:   []string{bindingKey},
+		MaxDeliveries: 2,
+		RetryDelay:    150 * time.Millisecond,
+	}, func(_ context.Context, msg Message) error {
+		receivedKRoutingKeysA = append(receivedKRoutingKeysA, msg.RoutingKey)
+		attemptsA.Add(1)
+		return fmt.Errorf("queueA always fails")
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, subA.Close())
+	})
+
+	subB, err := client.Subscribe(ctx, SubscribeOptions{
+		Queue:         queueB,
+		BindingKeys:   []string{bindingKey},
+		MaxDeliveries: 2,
+		RetryDelay:    150 * time.Millisecond,
+	}, func(_ context.Context, msg Message) error {
+		if attemptsB.Add(1) == 1 {
+			close(doneB)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, subB.Close())
+	})
+
+	require.NoError(t, client.Publish(ctx, routingKey, []byte("isolated"), WithMessageID("iso-1")))
+
+	select {
+	case <-doneB:
+	case <-ctx.Done():
+		t.Fatalf("wait queueB message failed: %v", ctx.Err())
+	}
+
+	nc, err := amqp.Dial(os.Getenv("RABBITMQ_URL"))
+	require.NoError(t, err)
+	defer nc.Close()
+
+	ch, err := nc.Channel()
+	require.NoError(t, err)
+	defer ch.Close()
+
+	deadline := time.After(10 * time.Second)
+	for {
+		msg, ok, err := ch.Get(dlqName(queueA), false)
+		require.NoError(t, err)
+		if ok {
+			require.Equal(t, "iso-1", msg.MessageId)
+			require.Equal(t, routingKey, msg.Headers[originalRoutingKeyHeader])
+			require.NoError(t, msg.Ack(false))
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("wait queueA dlq message timeout")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// 验证 queueA 精确消费了 MaxDeliveries(2) 次，且每次看到的 RoutingKey 均为原始业务 routingKey。
+	require.Equal(t, int32(2), attemptsA.Load())
+	require.Equal(t, []string{routingKey, routingKey}, receivedKRoutingKeysA)
+
+	// 验证 queueB 只收到过 1 次正常投递，未被 queueA 的 retry 或死信回流污染，且 queueB 的 DLQ 为空。
+	require.Equal(t, int32(1), attemptsB.Load())
+	_, okB, err := ch.Get(dlqName(queueB), false)
+	require.NoError(t, err)
+	require.False(t, okB, "queueB DLQ must be empty")
+}
+
+// TestIntegrationSubscribeSurvivesStartupContextCancel 验证 Subscribe 的入参 ctx 在建连返回后取消不会终止后台订阅消费。
+func TestIntegrationSubscribeSurvivesStartupContextCancel(t *testing.T) {
+	client := newIntegrationClient(t)
+	routingKey, queue := integrationNames(t)
+
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	received := make(chan Message, 1)
+	sub, err := client.Subscribe(startupCtx, SubscribeOptions{
+		Queue:       queue,
+		BindingKeys: []string{routingKey},
+	}, func(_ context.Context, msg Message) error {
+		received <- msg
+		return nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, sub.Close())
+	})
+
+	// 立即取消启动期 context，模拟调用方 defer cancel()
+	startupCancel()
+	time.Sleep(100 * time.Millisecond)
+
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(pubCancel)
+	require.NoError(t, client.Publish(pubCtx, routingKey, []byte("still-alive"), WithMessageID("survive-1")))
+
+	select {
+	case msg := <-received:
+		require.Equal(t, "survive-1", msg.ID)
+	case <-pubCtx.Done():
+		t.Fatalf("subscription stopped after startup context was canceled: %v", pubCtx.Err())
+	}
+}
+
 // TestIntegrationEnsureTopologyPreservesMessageBeforeSubscribe 验证预建拓扑后订阅未启动也不会丢消息。
 func TestIntegrationEnsureTopologyPreservesMessageBeforeSubscribe(t *testing.T) {
 	client := newIntegrationClient(t)
@@ -183,7 +306,6 @@ func TestIntegrationEnsureTopologyPreservesMessageBeforeSubscribe(t *testing.T) 
 
 	opts := SubscribeOptions{
 		Queue:       queue,
-		RoutingKey:  routingKey,
 		BindingKeys: []string{routingKey},
 	}
 	require.NoError(t, client.EnsureTopology(ctx, opts))
@@ -246,7 +368,6 @@ func TestIntegrationSubscribeRecoversAfterConnectionClose(t *testing.T) {
 	received := make(chan Message, 2)
 	sub, err := client.Subscribe(ctx, SubscribeOptions{
 		Queue:       queue,
-		RoutingKey:  routingKey,
 		BindingKeys: []string{routingKey},
 	}, func(_ context.Context, msg Message) error {
 		received <- msg
@@ -300,7 +421,6 @@ func TestIntegrationRecoversAfterBrokerRestart(t *testing.T) {
 	received := make(chan Message, 4)
 	sub, err := client.Subscribe(ctx, SubscribeOptions{
 		Queue:       queue,
-		RoutingKey:  routingKey,
 		BindingKeys: []string{routingKey},
 	}, func(_ context.Context, msg Message) error {
 		received <- msg

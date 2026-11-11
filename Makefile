@@ -11,7 +11,7 @@ STATICCHECK_MODULE ?= honnef.co/go/tools/cmd/staticcheck@v0.8.1
 GOVULNCHECK_MODULE ?= golang.org/x/vuln/cmd/govulncheck@latest
 NILAWAY      ?= $(LOCAL_BIN)/nilaway
 NILAWAY_MODULE ?= go.uber.org/nilaway/cmd/nilaway@latest
-GOTOOLCHAIN  ?= go1.26.8
+GOTOOLCHAIN  ?= go1.26.10
 AUDIT_DIR    ?= tmp/audit-$(shell date +%Y%m%d)
 AUDIT_GO     = env GOTOOLCHAIN=$(GOTOOLCHAIN) $(GO)
 

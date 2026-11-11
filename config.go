@@ -1,8 +1,7 @@
-// Package mq 基于 RabbitMQ AMQP 0-9-1 提供服务间异步消息发布与订阅能力。
-// 该文件定义客户端配置、日志抽象和配置默认值。
 package mq
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -18,6 +17,9 @@ const (
 
 	// DefaultCloseTimeout 表示默认关闭订阅和连接的等待时间。
 	DefaultCloseTimeout = 5 * time.Second
+
+	// DefaultHeartbeat 表示默认 AMQP 心跳间隔。
+	DefaultHeartbeat = 10 * time.Second
 
 	// DefaultExchangeType 表示默认 exchange 类型。
 	DefaultExchangeType = "topic"
@@ -53,7 +55,8 @@ type Config struct {
 	// Exchange 表示当前客户端固定使用的业务 exchange。
 	Exchange string
 
-	// ExchangeType 表示 exchange 类型；为空默认 topic。
+	// ExchangeType 表示 exchange 类型；为空默认 topic，支持 "topic"、"direct"、"fanout"。
+	// 若 Broker 上已存在同名 exchange，此处类型必须与其一致，否则初始化会返回 PRECONDITION_FAILED。
 	ExchangeType string
 
 	// ConnectTimeout 表示建立连接的超时时间。
@@ -75,23 +78,32 @@ type slogLogger struct {
 }
 
 func (l *slogLogger) Infof(format string, args ...any) {
+	if l == nil || l.log == nil || !l.log.Enabled(context.Background(), slog.LevelInfo) {
+		return
+	}
 	l.log.Info(fmt.Sprintf(format, args...))
 }
 
 func (l *slogLogger) Warnf(format string, args ...any) {
+	if l == nil || l.log == nil || !l.log.Enabled(context.Background(), slog.LevelWarn) {
+		return
+	}
 	l.log.Warn(fmt.Sprintf(format, args...))
 }
 
 func (l *slogLogger) Errorf(format string, args ...any) {
+	if l == nil || l.log == nil || !l.log.Enabled(context.Background(), slog.LevelError) {
+		return
+	}
 	l.log.Error(fmt.Sprintf(format, args...))
 }
 
 // normalizeConfig 校验客户端配置，并补齐连接、发布和关闭相关默认值。
 func normalizeConfig(cfg Config) (Config, error) {
+	// 1. 清理字符串首尾空白并校验必填连接地址与主交换机名称。
 	cfg.URL = strings.TrimSpace(cfg.URL)
 	cfg.Name = strings.TrimSpace(cfg.Name)
 	cfg.Exchange = strings.TrimSpace(cfg.Exchange)
-	cfg.ExchangeType = strings.TrimSpace(cfg.ExchangeType)
 
 	if cfg.URL == "" {
 		return Config{}, fmt.Errorf("create rabbitmq client failed: url is required")
@@ -99,9 +111,15 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if cfg.Exchange == "" {
 		return Config{}, fmt.Errorf("create rabbitmq client failed: exchange is required")
 	}
-	if cfg.ExchangeType == "" {
-		cfg.ExchangeType = DefaultExchangeType
+
+	// 2. 校验并规范化交换机类型（默认 topic）。
+	exchangeType, err := normalizeExchangeType(cfg.ExchangeType)
+	if err != nil {
+		return Config{}, err
 	}
+	cfg.ExchangeType = exchangeType
+
+	// 3. 补齐建连、发布确认、关闭等待超时及默认日志器。
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = DefaultConnectTimeout
 	}
@@ -116,6 +134,20 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizeExchangeType 校验并归一化 RabbitMQ 交换机类型（支持 topic/direct/fanout）。
+func normalizeExchangeType(exchangeType string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(exchangeType))
+	if normalized == "" {
+		return DefaultExchangeType, nil
+	}
+	switch normalized {
+	case "topic", "direct", "fanout":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("create rabbitmq client failed: unsupported exchange type %q", exchangeType)
+	}
 }
 
 // defaultLogger 返回 mq 默认日志实现。
