@@ -25,10 +25,10 @@ flowchart LR
     EX -->|"BindingKey: test.order.*"| Q["主消费队列<br/>example-service.order-events"]
     Q -->|"2. 投递消费"| H["Consumer Handler<br/>(Concurrency Workers)"]
     H -->|"成功 (return nil)"| ACK["Ack(false)<br/>消费完成"]
-    H -->|"失败 / Panic 且 DeliveryCount < MaxDeliveries"| REX["Retry Exchange<br/>test.events.retry (direct)"]
+    H -->|"失败 / Panic 且 DeliveryCount < MaxDeliveries"| REX["Retry Exchange<br/>test.events.retry (默认 topic/可配 direct)"]
     REX -->|"RoutingKey = 主队列名"| RQ["专属 Retry Queue<br/>example-service.order-events.retry.2000<br/>(x-message-ttl=2000ms)"]
     RQ -->|"TTL 到期经默认交换机 ''<br/>x-dead-letter-routing-key = 主队列名"| Q
-    H -->|"失败 / Panic 且 DeliveryCount >= MaxDeliveries"| DLX["Dead Letter Exchange<br/>test.events.dlx (direct)"]
+    H -->|"失败 / Panic 且 DeliveryCount >= MaxDeliveries"| DLX["Dead Letter Exchange<br/>test.events.dlx (默认 topic/可配 direct)"]
     DLX -->|"RoutingKey = 主队列名"| DLQ["专属死信队列 DLQ<br/>example-service.order-events.dlq"]
 ```
 
@@ -43,8 +43,8 @@ flowchart LR
 | 资源类型 | 名称示例 | 类型 / 属性 | 作用 |
 | --- | --- | --- | --- |
 | 主 Exchange | `test.events` | 默认 `topic`（支持 `direct`/`fanout`） | 接收业务发布消息并按 `BindingKeys` 路由到各主队列 |
-| Retry Exchange | `test.events.retry` | `direct` | 按主队列名点对点路由失败待重试消息 |
-| DLX | `test.events.dlx` | `direct` | 按主队列名点对点路由达到 `MaxDeliveries` 的死信消息 |
+| Retry Exchange | `test.events.retry` | 默认 `topic`（可配置 `direct`） | 按主队列名点对点路由失败待重试消息 |
+| DLX | `test.events.dlx` | 默认 `topic`（可配置 `direct`） | 按主队列名点对点路由达到 `MaxDeliveries` 的死信消息 |
 | 主消费队列 | `example-service.order-events` | `durable=true` | 业务消费者实际拉取消息的队列 |
 | 延迟重试队列 | `example-service.order-events.retry.2000` | `durable=true`, `x-message-ttl=2000` | 存放延迟重试消息，TTL 到期后点对点死信回原主队列 |
 | 死信队列 (DLQ) | `example-service.order-events.dlq` | `durable=true` | 存放最终失败消息，供告警、排查或离线重放 |
@@ -213,7 +213,9 @@ func run(ctx context.Context) error {
 
 | 参数 | 所属结构体 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `ExchangeType` | `Config` | `"topic"` | 支持 `"topic"`、`"direct"`、`"fanout"` |
+| `ExchangeType` | `Config` | `"topic"` | 主业务交换机类型，支持 `"topic"`、`"direct"`、`"fanout"` |
+| `RetryExchangeType` | `Config` | `"topic"` | 延迟重试交换机类型；为空默认 `"topic"`，支持配置为 `"direct"` |
+| `DeadLetterExchangeType` | `Config` | `"topic"` | 死信交换机类型；为空默认跟随 `RetryExchangeType`，支持配置为 `"direct"` |
 | `ConnectTimeout` | `Config` | `5s` | 建立底层 TCP/AMQP 连接超时时间（内置 `10s` AMQP 心跳） |
 | `PublishTimeout` | `Config` | `5s` | 单次 `Publish` 等待 Broker Confirm 的超时时间 |
 | `CloseTimeout` | `Config` | `5s` | `Close()` 等待消费循环退出的最大时间 |
