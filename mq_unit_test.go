@@ -608,14 +608,9 @@ func TestTopologyDeclarationAndEnsure(t *testing.T) {
 
 	t.Run("ensure_topology_custom_direct_types", func(t *testing.T) {
 		conn := &fakeAMQPConnection{}
-		client := &Client{
-			exchange:               "test.events",
-			exchangeType:           "topic",
-			retryExchangeType:      "direct",
-			deadLetterExchangeType: "direct",
-			conn:                   conn,
-			subs:                   make(map[*subscription]struct{}),
-		}
+		client := newTestClientWithConn(t, conn)
+		client.retryExchangeType = "direct"
+		client.deadLetterExchangeType = "direct"
 		ch := &fakeAMQPChannel{parent: conn}
 		conn.chFactory = func() *fakeAMQPChannel { return ch }
 
