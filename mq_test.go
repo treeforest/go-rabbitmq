@@ -191,6 +191,8 @@ func TestNormalizeConfig(t *testing.T) {
 			},
 			verify: func(t *testing.T, got Config) {
 				require.Equal(t, DefaultExchangeType, got.ExchangeType)
+				require.Equal(t, DefaultExchangeType, got.RetryExchangeType)
+				require.Equal(t, DefaultExchangeType, got.DeadLetterExchangeType)
 				require.Equal(t, DefaultConnectTimeout, got.ConnectTimeout)
 				require.Equal(t, DefaultPublishTimeout, got.PublishTimeout)
 				require.Equal(t, DefaultCloseTimeout, got.CloseTimeout)
@@ -200,21 +202,55 @@ func TestNormalizeConfig(t *testing.T) {
 		{
 			name: "custom_values_preserved",
 			cfg: Config{
-				URL:            "amqp://guest:guest@127.0.0.1:5672/",
-				Exchange:       "test.events",
-				ExchangeType:   "direct",
-				ConnectTimeout: time.Second,
-				PublishTimeout: 2 * time.Second,
-				CloseTimeout:   3 * time.Second,
-				Logger:         &fakeLogger{},
+				URL:                    "amqp://guest:guest@127.0.0.1:5672/",
+				Exchange:               "test.events",
+				ExchangeType:           "direct",
+				RetryExchangeType:      "direct",
+				DeadLetterExchangeType: "direct",
+				ConnectTimeout:         time.Second,
+				PublishTimeout:         2 * time.Second,
+				CloseTimeout:           3 * time.Second,
+				Logger:                 &fakeLogger{},
 			},
 			verify: func(t *testing.T, got Config) {
 				require.Equal(t, "direct", got.ExchangeType)
+				require.Equal(t, "direct", got.RetryExchangeType)
+				require.Equal(t, "direct", got.DeadLetterExchangeType)
 				require.Equal(t, time.Second, got.ConnectTimeout)
 				require.Equal(t, 2*time.Second, got.PublishTimeout)
 				require.Equal(t, 3*time.Second, got.CloseTimeout)
 				require.IsType(t, &fakeLogger{}, got.Logger)
 			},
+		},
+		{
+			name: "retry_exchange_fallback_to_dlx",
+			cfg: Config{
+				URL:               "amqp://guest:guest@127.0.0.1:5672/",
+				Exchange:          "test.events",
+				RetryExchangeType: "direct",
+			},
+			verify: func(t *testing.T, got Config) {
+				require.Equal(t, "direct", got.RetryExchangeType)
+				require.Equal(t, "direct", got.DeadLetterExchangeType)
+			},
+		},
+		{
+			name: "invalid_retry_exchange_type",
+			cfg: Config{
+				URL:               "amqp://guest:guest@127.0.0.1:5672/",
+				Exchange:          "test.events",
+				RetryExchangeType: "headers",
+			},
+			wantErr: "invalid retry exchange type",
+		},
+		{
+			name: "invalid_dlx_exchange_type",
+			cfg: Config{
+				URL:                    "amqp://guest:guest@127.0.0.1:5672/",
+				Exchange:               "test.events",
+				DeadLetterExchangeType: "invalid-type",
+			},
+			wantErr: "invalid dead letter exchange type",
 		},
 	}
 

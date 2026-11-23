@@ -270,18 +270,22 @@ func newTestClientWithConn(t *testing.T, conn *fakeAMQPConnection) *Client {
 	publisher := newAMQPPublisher(pubCh, time.Second)
 	client := &Client{
 		cfg: Config{
-			URL:            "amqp://fake/",
-			Exchange:       "test.events",
-			ExchangeType:   DefaultExchangeType,
-			ConnectTimeout: time.Second,
-			PublishTimeout: time.Second,
-			CloseTimeout:   time.Second,
+			URL:                    "amqp://fake/",
+			Exchange:               "test.events",
+			ExchangeType:           DefaultExchangeType,
+			RetryExchangeType:      DefaultExchangeType,
+			DeadLetterExchangeType: DefaultExchangeType,
+			ConnectTimeout:         time.Second,
+			PublishTimeout:         time.Second,
+			CloseTimeout:           time.Second,
 		},
-		name:           "unit",
-		exchange:       "test.events",
-		exchangeType:   DefaultExchangeType,
-		publishTimeout: time.Second,
-		closeTimeout:   time.Second,
+		name:                   "unit",
+		exchange:               "test.events",
+		exchangeType:           DefaultExchangeType,
+		retryExchangeType:      DefaultExchangeType,
+		deadLetterExchangeType: DefaultExchangeType,
+		publishTimeout:         time.Second,
+		closeTimeout:           time.Second,
 		log:            &fakeLogger{},
 		conn:           conn,
 		publishCh:      pubCh,
@@ -587,8 +591,8 @@ func TestTopologyDeclarationAndEnsure(t *testing.T) {
 		}
 		require.NoError(t, client.EnsureTopology(context.Background(), opts))
 		require.Contains(t, strings.Join(ch.exchanges, ","), "test.events:topic")
-		require.Contains(t, strings.Join(ch.exchanges, ","), ".retry:direct")
-		require.Contains(t, strings.Join(ch.exchanges, ","), ".dlx:direct")
+		require.Contains(t, strings.Join(ch.exchanges, ","), ".retry:topic")
+		require.Contains(t, strings.Join(ch.exchanges, ","), ".dlx:topic")
 
 		var retryQ *fakeQueueDeclare
 		for i := range ch.queues {
@@ -600,6 +604,30 @@ func TestTopologyDeclarationAndEnsure(t *testing.T) {
 		require.NotNil(t, retryQ)
 		require.Equal(t, "", retryQ.args["x-dead-letter-exchange"])
 		require.Equal(t, "q1", retryQ.args["x-dead-letter-routing-key"])
+	})
+
+	t.Run("ensure_topology_custom_direct_types", func(t *testing.T) {
+		conn := &fakeAMQPConnection{}
+		client := &Client{
+			exchange:               "test.events",
+			exchangeType:           "topic",
+			retryExchangeType:      "direct",
+			deadLetterExchangeType: "direct",
+			conn:                   conn,
+			subs:                   make(map[*subscription]struct{}),
+		}
+		ch := &fakeAMQPChannel{parent: conn}
+		conn.chFactory = func() *fakeAMQPChannel { return ch }
+
+		opts := SubscribeOptions{
+			Queue:       "q1",
+			BindingKeys: []string{"k.*"},
+			RetryDelay:  time.Second,
+		}
+		require.NoError(t, client.EnsureTopology(context.Background(), opts))
+		require.Contains(t, strings.Join(ch.exchanges, ","), "test.events:topic")
+		require.Contains(t, strings.Join(ch.exchanges, ","), ".retry:direct")
+		require.Contains(t, strings.Join(ch.exchanges, ","), ".dlx:direct")
 	})
 
 	t.Run("declare_topology_ctx_canceled", func(t *testing.T) {

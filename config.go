@@ -59,6 +59,15 @@ type Config struct {
 	// 若 Broker 上已存在同名 exchange，此处类型必须与其一致，否则初始化会返回 PRECONDITION_FAILED。
 	ExchangeType string
 
+	// RetryExchangeType 表示延迟重试交换机类型；为空默认 topic，支持 "topic"、"direct"、"fanout"。
+	// 若 Broker 上已存在同名重试 exchange（例如线上历史声明为 topic），此处类型必须与其一致。
+	RetryExchangeType string
+
+	// DeadLetterExchangeType 表示死信交换机类型；为空默认跟随 RetryExchangeType（即 topic）。
+	// 支持 "topic"、"direct"、"fanout"。
+	// 若 Broker 上已存在同名死信 exchange（例如线上历史声明为 topic），此处类型必须与其一致。
+	DeadLetterExchangeType string
+
 	// ConnectTimeout 表示建立连接的超时时间。
 	ConnectTimeout time.Duration
 
@@ -112,12 +121,32 @@ func normalizeConfig(cfg Config) (Config, error) {
 		return Config{}, fmt.Errorf("create rabbitmq client failed: exchange is required")
 	}
 
-	// 2. 校验并规范化交换机类型（默认 topic）。
+	// 2. 校验并规范化交换机类型（主 exchange、retry exchange、DLX 均默认 topic）。
 	exchangeType, err := normalizeExchangeType(cfg.ExchangeType)
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.ExchangeType = exchangeType
+
+	if cfg.RetryExchangeType == "" {
+		cfg.RetryExchangeType = DefaultExchangeType
+	} else {
+		retryType, err := normalizeExchangeType(cfg.RetryExchangeType)
+		if err != nil {
+			return Config{}, fmt.Errorf("create rabbitmq client failed: invalid retry exchange type: %w", err)
+		}
+		cfg.RetryExchangeType = retryType
+	}
+
+	if cfg.DeadLetterExchangeType == "" {
+		cfg.DeadLetterExchangeType = cfg.RetryExchangeType
+	} else {
+		dlxType, err := normalizeExchangeType(cfg.DeadLetterExchangeType)
+		if err != nil {
+			return Config{}, fmt.Errorf("create rabbitmq client failed: invalid dead letter exchange type: %w", err)
+		}
+		cfg.DeadLetterExchangeType = dlxType
+	}
 
 	// 3. 补齐建连、发布确认、关闭等待超时及默认日志器。
 	if cfg.ConnectTimeout <= 0 {

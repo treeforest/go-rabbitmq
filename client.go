@@ -149,12 +149,14 @@ var dialTransport = func(url string, cfg amqp.Config) (amqpConnection, error) {
 type Client struct {
 	cfg Config
 
-	name           string
-	exchange       string
-	exchangeType   string
-	publishTimeout time.Duration
-	closeTimeout   time.Duration
-	log            Logger
+	name                   string
+	exchange               string
+	exchangeType           string
+	retryExchangeType      string
+	deadLetterExchangeType string
+	publishTimeout         time.Duration
+	closeTimeout           time.Duration
+	log                    Logger
 
 	publisher messagePublisher
 	publishMu sync.Mutex
@@ -186,16 +188,18 @@ func NewClient(cfg Config) (*Client, error) {
 	// 2. 初始化客户端结构体与全局生命周期上下文。
 	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 	client := &Client{
-		cfg:            normalized,
-		name:           normalized.Name,
-		exchange:       normalized.Exchange,
-		exchangeType:   normalized.ExchangeType,
-		publishTimeout: normalized.PublishTimeout,
-		closeTimeout:   normalized.CloseTimeout,
-		log:            normalized.Logger,
-		lifeCtx:        lifeCtx,
-		lifeCancel:     lifeCancel,
-		subs:           make(map[*subscription]struct{}),
+		cfg:                    normalized,
+		name:                   normalized.Name,
+		exchange:               normalized.Exchange,
+		exchangeType:           normalized.ExchangeType,
+		retryExchangeType:      normalized.RetryExchangeType,
+		deadLetterExchangeType: normalized.DeadLetterExchangeType,
+		publishTimeout:         normalized.PublishTimeout,
+		closeTimeout:           normalized.CloseTimeout,
+		log:                    normalized.Logger,
+		lifeCtx:                lifeCtx,
+		lifeCancel:             lifeCancel,
+		subs:                   make(map[*subscription]struct{}),
 	}
 
 	// 3. 建立初始 AMQP 连接、发布通道并声明主交换机。

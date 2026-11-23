@@ -9,8 +9,6 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-const directExchangeType = "direct"
-
 // EnsureTopology 预声明订阅所需的 RabbitMQ 交换机、队列与路由绑定。
 // 包含主 exchange、retry exchange、DLX，以及主队列、延迟重试队列、DLQ 和对应 binding。
 // 不启动消费者；适用于先建队列再发布，避免 Subscribe 启动前消息无处落库的场景。
@@ -60,8 +58,8 @@ func declareExchange(ch amqpChannel, name, kind string) error {
 }
 
 // declareTopology 在 broker 上声明单条订阅链路所需的交换机、队列与路由绑定。
-// 消息流转：主 exchange -> 主队列消费；失败 -> retry exchange (direct, key=queue) -> retryQueue
-// -> TTL 到期经默认交换机 "" (key=queue) 精准回主队列；超过 MaxDeliveries -> DLX (direct, key=queue) -> DLQ。
+// 消息流转：主 exchange -> 主队列消费；失败 -> retry exchange (默认 topic/可配 direct, key=queue) -> retryQueue
+// -> TTL 到期经默认交换机 "" (key=queue) 精准回主队列；超过 MaxDeliveries -> DLX (默认 topic/可配 direct, key=queue) -> DLQ。
 func (c *Client) declareTopology(ctx context.Context, ch amqpChannel, opts SubscribeOptions) error {
 	select {
 	case <-ctx.Done():
@@ -69,14 +67,14 @@ func (c *Client) declareTopology(ctx context.Context, ch amqpChannel, opts Subsc
 	default:
 	}
 
-	// 1. 声明三条 exchange：主业务交换机使用配置类型，延迟重试与死信交换机固定使用 direct 按队列名点对点路由。
+	// 1. 声明三条 exchange：主业务交换机、延迟重试与死信交换机使用配置类型（默认 topic，可配置为 direct 等）。
 	if err := declareExchange(ch, c.exchange, c.exchangeType); err != nil {
 		return fmt.Errorf("declare main exchange %s: %w", c.exchange, err)
 	}
-	if err := declareExchange(ch, retryExchangeName(c.exchange), directExchangeType); err != nil {
+	if err := declareExchange(ch, retryExchangeName(c.exchange), c.retryExchangeType); err != nil {
 		return fmt.Errorf("declare retry exchange %s: %w", retryExchangeName(c.exchange), err)
 	}
-	if err := declareExchange(ch, deadLetterExchangeName(c.exchange), directExchangeType); err != nil {
+	if err := declareExchange(ch, deadLetterExchangeName(c.exchange), c.deadLetterExchangeType); err != nil {
 		return fmt.Errorf("declare dead letter exchange %s: %w", deadLetterExchangeName(c.exchange), err)
 	}
 
